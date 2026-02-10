@@ -1,7 +1,7 @@
 # Data source to create deployment package
 data "archive_file" "calculator_lambda" {
   type        = "zip"
-  output_path = "${path.module}/.terraform/calculator_lambda.zip"
+  output_path = "${path.module}/build/calculator_lambda.zip"
 
   source {
     content  = file("${path.module}/../lambda/calculator_handler.py")
@@ -86,7 +86,7 @@ resource "aws_cloudwatch_log_group" "calculator" {
 # Data source for API Lambda package
 data "archive_file" "api_lambda" {
   type        = "zip"
-  output_path = "${path.module}/.terraform/api_lambda.zip"
+  output_path = "${path.module}/build/api_lambda.zip"
 
   source {
     content  = file("${path.module}/../lambda/api_handler.py")
