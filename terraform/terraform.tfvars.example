@@ -1,0 +1,23 @@
+# Copy this file to terraform.tfvars and fill in your values
+# IMPORTANT: Never commit terraform.tfvars to version control!
+
+# AWS Configuration
+aws_region  = "us-east-1"
+environment = "prod"
+
+# Ethereum RPC URL (REQUIRED)
+# Get one from: Infura, Alchemy, QuickNode, or run your own node
+eth_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY_HERE"
+
+# Route53 Configuration (REQUIRED)
+# Find your zone ID: aws route53 list-hosted-zones
+route53_zone_id = "Z1234567890ABC"
+
+# Optional: Update Validation
+# Reject updates if supply drops more than this percentage
+# 0.95 = reject if drops >5%, 0.90 = reject if drops >10%
+update_threshold_percentage = 0.95
+
+# Optional: Lambda Configuration
+lambda_timeout = 300  # seconds (5 minutes)
+lambda_memory  = 512  # MB
