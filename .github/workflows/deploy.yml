@@ -14,7 +14,7 @@ permissions:
   deployments: write
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: eu-west-2
   ENVIRONMENT: prod
   TF_DIR: terraform
 

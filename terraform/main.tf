@@ -13,14 +13,14 @@ terraform {
   }
 
   backend "s3" {
-    # Configure backend in backend.tfvars or via CLI
-    # bucket = "your-terraform-state-bucket"
-    # key    = "aztec-supply/terraform.tfstate"
-    # region = "us-east-1"
+    bucket = "aztec-foundation-terraform-state"
+    key    = "circulating-supply-api"
+    region = "eu-west-2"
   }
 }
 
 provider "aws" {
+  profile = "foundation"
   region = var.aws_region
 
   default_tags {
