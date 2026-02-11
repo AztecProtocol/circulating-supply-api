@@ -62,7 +62,7 @@ jobs:
             -backend-config="key=circulating-supply-api" \
             -backend-config="region=${AWS_REGION}"
 
-      - name: Terraform plan (no apply)
+      - name: Terraform plan
         working-directory: ${{ env.TF_DIR }}
         run: terraform plan -out=tfplan -input=false
         env:
