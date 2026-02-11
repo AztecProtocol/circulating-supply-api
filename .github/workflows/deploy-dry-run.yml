@@ -58,7 +58,7 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform init \
-            -backend-config="bucket=aztec-foundation-terraform-state" \
+            -backend-config="bucket=aztec-circ-supply-terraform" \
             -backend-config="key=circulating-supply-api" \
             -backend-config="region=${AWS_REGION}"
 
