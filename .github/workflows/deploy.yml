@@ -45,15 +45,19 @@ jobs:
           environment: production
           description: "Deploy ${{ github.sha }}"
 
+      - name: Install Poetry
+        run: pip install poetry poetry-plugin-export
+
       - name: Build Lambda layer
         run: |
           mkdir -p build/lambda-layer/python
+          poetry export -f requirements.txt --without-hashes -o build/requirements.txt
           pip install \
             --target build/lambda-layer/python \
             --platform manylinux2014_x86_64 \
             --python-version 3.11 \
             --only-binary=:all: \
-            web3 eth-abi
+            -r build/requirements.txt
           cd build/lambda-layer
           zip -r ../python-deps.zip python/ > /dev/null
 
@@ -66,8 +70,8 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform init \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=aztec-supply/terraform.tfstate" \
+            -backend-config="bucket=aztec-foundation-terraform-state" \
+            -backend-config="key=circulating-supply-api" \
             -backend-config="region=${AWS_REGION}"
 
       - name: Terraform plan

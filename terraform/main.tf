@@ -32,10 +32,11 @@ provider "aws" {
   }
 }
 
-# For ACM certificates (must be in us-east-1 for CloudFront)
+# ACM certificates for CloudFront must be in us-east-1
 provider "aws" {
-  alias  = "us_east_1"
-  region = "us-east-1"
+  alias   = "us_east_1"
+  profile = "foundation"
+  region  = "us-east-1"
 
   default_tags {
     tags = {

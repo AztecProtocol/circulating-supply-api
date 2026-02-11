@@ -35,9 +35,9 @@ output "cloudwatch_log_groups" {
 output "api_routes" {
   description = "Available API routes"
   value = {
-    full   = "https://${local.domain_name}/"
-    supply = "https://${local.domain_name}/supply"
-    simple = "https://${local.domain_name}/simple"
-    raw    = "https://${local.domain_name}/raw"
+    default = "https://${local.domain_name}/"
+    all     = "https://${local.domain_name}/all"
+    simple  = "https://${local.domain_name}/simple"
+    raw     = "https://${local.domain_name}/raw"
   }
 }

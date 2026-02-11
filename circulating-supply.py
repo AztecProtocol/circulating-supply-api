@@ -56,6 +56,7 @@ FACTORIES = [
     "0x42Df694EdF32d5AC19A75E1c7f91C982a7F2a161",  # Token Sale Factory (auction/distribution)
     "0xfd6Bde35Ec36906D61c1977C82Dc429E9b009940",  # ATPFactory v3 (foundation grants)
     "0xFc5344E82C8DEb027F9fbc95F92a94eef91f9afC",  # ATPFactory v4 (foundation self-lock)
+    "0x278f39b11b3de0796561e85cb48535c9f45ddfcc",  # ATPFactory v5 (investors)
 ]
 
 # Token Sale contract (also holds tokens directly - locked until isRewardsClaimable)
@@ -259,34 +260,32 @@ def discover_contract_addresses():
 
 def get_logs_safe(address, topics, from_block=None):
     """Get logs with fallback for range-limited RPCs."""
-    # Use provided from_block or default to 0
     start_block = from_block if from_block is not None else 0
 
     params = {
         "address": to_checksum_cached(address),
-        "topics": topics,
-        "fromBlock": start_block,
+        "topics": ["0x" + t.hex() if isinstance(t, bytes) else t for t in topics],
+        "fromBlock": hex(start_block),
         "toBlock": "latest",
     }
     try:
         return retry(lambda: w3.eth.get_logs(params))
-    except Exception:
-        # If RPC rejects full range, chunk into 2M block segments
+    except Exception as e:
+        print(f"    get_logs full range failed ({e}), falling back to chunking...")
         latest = retry(lambda: w3.eth.block_number)
         all_logs = []
         chunk_size = 2_000_000
         current = start_block
         while current <= latest:
-            params["fromBlock"] = current
-            params["toBlock"] = min(current + chunk_size - 1, latest)
+            params["fromBlock"] = hex(current)
+            params["toBlock"] = hex(min(current + chunk_size - 1, latest))
             try:
                 chunk_logs = retry(lambda: w3.eth.get_logs(params))
                 all_logs.extend(chunk_logs)
                 current += chunk_size
             except Exception:
-                # If even 2M blocks fail, reduce to 500k
-                chunk_size = 500_000
-                if chunk_size < 100_000:
+                chunk_size = chunk_size // 4
+                if chunk_size < 10_000:
                     raise
         return all_logs
 
@@ -785,6 +784,7 @@ def display(atps, data):
         "0x42Df694EdF32d5AC19A75E1c7f91C982a7F2a161": "Token Sale Factory (auction)",
         "0xfd6Bde35Ec36906D61c1977C82Dc429E9b009940": "ATPFactory v3 (foundation grants)",
         "0xFc5344E82C8DEb027F9fbc95F92a94eef91f9afC": "ATPFactory v4 (foundation self-lock)",
+        "0x278f39b11b3de0796561e85cb48535c9f45ddfcc": "ATPFactory v5 (investors)",
     }
 
     for a in atps:

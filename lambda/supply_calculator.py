@@ -5,6 +5,7 @@ This is a wrapper around the main circulating-supply.py script.
 
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 # Add parent directory to import the original script
@@ -24,6 +25,7 @@ def calculate_supply():
             discover_contract_addresses,
             fetch_atps,
             fetch_data,
+            unlock_frac,
             w3,
             retry
         )
@@ -41,8 +43,22 @@ def calculate_supply():
         # Calculate locked and circulating supply
         total_supply = data["total_supply"]
 
-        # Calculate total locked (matching display() logic)
-        total_atp_locked = sum(a.get("locked", 0) for a in atps)
+        # Compute per-ATP locked amounts (same logic as display())
+        now = int(time.time())
+        global_lock = data["global_lock"]
+        frac = unlock_frac(global_lock, now) if global_lock else 0.0
+
+        for a in atps:
+            wts = a.get("withdrawal_ts")
+            if a["atp_type"] == 2 and wts is not None:
+                a["locked"] = a["allocation"] if now < wts else 0
+            else:
+                unlocked_by_schedule = int(a["allocation"] * frac)
+                a["locked"] = max(
+                    0, a["allocation"] - max(unlocked_by_schedule, a["claimed"])
+                )
+
+        total_atp_locked = sum(a["locked"] for a in atps)
         locked_future_incentives = data["other_bals"].get("Future Incentives", 0)
         locked_y1_rewards = data["other_bals"].get("Y1 Network Rewards", 0)
         locked_investor_wallet = data["other_bals"].get("Investor Wallet", 0)

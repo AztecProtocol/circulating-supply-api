@@ -60,9 +60,9 @@ resource "aws_apigatewayv2_route" "root" {
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 }
 
-resource "aws_apigatewayv2_route" "supply" {
+resource "aws_apigatewayv2_route" "all" {
   api_id    = aws_apigatewayv2_api.supply.id
-  route_key = "GET /supply"
+  route_key = "GET /all"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 }
 
@@ -78,9 +78,9 @@ resource "aws_apigatewayv2_route" "raw" {
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 }
 
-# Custom Domain - ACM Certificate
+# ACM Certificate (must be in us-east-1 for CloudFront)
 resource "aws_acm_certificate" "supply" {
-  provider          = aws.us_east_1 # Must be in us-east-1 for API Gateway
+  provider          = aws.us_east_1
   domain_name       = local.domain_name
   validation_method = "DNS"
 
@@ -114,20 +114,55 @@ resource "aws_acm_certificate_validation" "supply" {
   validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
 }
 
-# API Gateway Custom Domain
-resource "aws_apigatewayv2_domain_name" "supply" {
-  domain_name = local.domain_name
+# CloudFront distribution - handles HTTP→HTTPS redirect and custom domain
+resource "aws_cloudfront_distribution" "supply" {
+  enabled         = true
+  aliases         = [local.domain_name]
+  is_ipv6_enabled = true
+  comment         = "Aztec Circulating Supply API"
 
-  domain_name_configuration {
-    certificate_arn = aws_acm_certificate_validation.supply.certificate_arn
-    endpoint_type   = "REGIONAL"
-    security_policy = "TLS_1_2"
+  origin {
+    domain_name = "${aws_apigatewayv2_api.supply.id}.execute-api.${var.aws_region}.amazonaws.com"
+    origin_id   = "api-gateway"
+    origin_path = "/${var.environment}"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
   }
-}
 
-# API Mapping
-resource "aws_apigatewayv2_api_mapping" "supply" {
-  api_id      = aws_apigatewayv2_api.supply.id
-  domain_name = aws_apigatewayv2_domain_name.supply.id
-  stage       = aws_apigatewayv2_stage.supply.id
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "api-gateway"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"]
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 300
+    max_ttl     = 3600
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.supply.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
 }

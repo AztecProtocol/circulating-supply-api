@@ -1,5 +1,0 @@
-# Python dependencies for AWS Lambda
-# Used by build-lambda-layer.sh to create the Lambda Layer
-
-web3>=6.0.0
-eth-abi>=4.0.0

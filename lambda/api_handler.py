@@ -41,36 +41,42 @@ def lambda_handler(event, context):
         data = json.loads(supply_data)
 
         # Determine which format to return based on path
-        path = event.get('path', '/')
-        query_params = event.get('queryStringParameters') or {}
+        # API Gateway HTTP API v2 uses 'rawPath', v1 uses 'path'
+        path = event.get('rawPath') or event.get('path', '/')
+        supply = data['circulating_supply_formatted'].replace(',', '')
 
         # Support different response formats
-        if query_params.get('format') == 'simple' or path == '/simple':
-            # Simple format - just the circulating supply number
-            simple_response = {
-                'circulating_supply': data['circulating_supply_formatted'],
-                'timestamp': data['timestamp']
-            }
-            return {
-                'statusCode': 200,
-                'headers': headers,
-                'body': json.dumps(simple_response, indent=2)
-            }
-
-        elif query_params.get('format') == 'raw' or path == '/raw':
-            # Raw format - just the number (for tools like CoinGecko)
-            return {
-                'statusCode': 200,
-                'headers': {**headers, 'Content-Type': 'text/plain'},
-                'body': data['circulating_supply_formatted']
-            }
-
-        else:
-            # Full format (default)
+        if path == '/all':
+            # Full data dump
             return {
                 'statusCode': 200,
                 'headers': headers,
                 'body': json.dumps(data, indent=2)
+            }
+
+        elif path == '/simple':
+            # Simple format - circulating supply + timestamp
+            # Build JSON manually to keep supply as an unquoted number
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': f'{{"circulating_supply": {supply}, "timestamp": {json.dumps(data["timestamp"])}}}'
+            }
+
+        elif path == '/raw':
+            # Raw format - just the number (for tools like CoinGecko)
+            return {
+                'statusCode': 200,
+                'headers': {**headers, 'Content-Type': 'text/plain'},
+                'body': supply
+            }
+
+        else:
+            # Default (/) - just the circulating supply
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': supply
             }
 
     except ClientError as e:
