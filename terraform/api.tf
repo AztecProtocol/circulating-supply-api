@@ -78,6 +78,12 @@ resource "aws_apigatewayv2_route" "raw" {
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "total" {
+  api_id    = aws_apigatewayv2_api.supply.id
+  route_key = "GET /total"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+}
+
 # ACM Certificate (must be in us-east-1 for CloudFront)
 resource "aws_acm_certificate" "supply" {
   provider          = aws.us_east_1

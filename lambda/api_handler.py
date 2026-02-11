@@ -46,7 +46,8 @@ def lambda_handler(event, context):
         supply = data['circulating_supply_formatted'].replace(',', '')
 
         # Support different response formats
-        if path == '/all':
+        # rawPath includes stage prefix for non-$default stages (e.g. /prod/all)
+        if path.endswith('/all'):
             # Full data dump
             return {
                 'statusCode': 200,
@@ -54,7 +55,7 @@ def lambda_handler(event, context):
                 'body': json.dumps(data, indent=2)
             }
 
-        elif path == '/simple':
+        elif path.endswith('/simple'):
             # Simple format - circulating supply + timestamp
             # Build JSON manually to keep supply as an unquoted number
             return {
@@ -63,7 +64,16 @@ def lambda_handler(event, context):
                 'body': f'{{"circulating_supply": {supply}, "timestamp": {json.dumps(data["timestamp"])}}}'
             }
 
-        elif path == '/raw':
+        elif path.endswith('/total'):
+            # Total supply
+            total = data['total_supply_formatted'].replace(',', '')
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': total
+            }
+
+        elif path.endswith('/raw'):
             # Raw format - just the number (for tools like CoinGecko)
             return {
                 'statusCode': 200,
