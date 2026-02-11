@@ -75,6 +75,9 @@ def calculate_supply():
         # Slashed funds
         locked_slashed = data["total_slashed_funds"]
 
+        # FlushRewarder: pending rewards
+        locked_flush_rewarder = data["flush_rewarder_locked"]
+
         total_locked = (
             total_atp_locked
             + locked_future_incentives
@@ -84,6 +87,7 @@ def calculate_supply():
             + locked_factories
             + locked_rollup_rewards
             + locked_slashed
+            + locked_flush_rewarder
         )
 
         circulating = total_supply - total_locked
@@ -117,6 +121,7 @@ def calculate_supply():
                 "factories": str(locked_factories),
                 "rollup_rewards": str(locked_rollup_rewards),
                 "slashed_funds": str(locked_slashed),
+                "flush_rewarder": str(locked_flush_rewarder),
             }
         }
 

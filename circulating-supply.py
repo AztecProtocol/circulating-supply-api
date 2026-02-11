@@ -67,6 +67,7 @@ UNISWAP_POOL = "0x000000000004444c5dc75cB358380D2e3dE08A90"  # Unlocked
 FUTURE_INCENTIVES = "0x662De311f94bdbB571D95B5909e9cC6A25a6802a"  # Locked
 Y1_REWARDS = "0x3D6A1B00C830C5f278FC5dFb3f6Ff0b74Db6dfe0"  # Locked
 INVESTOR_WALLET = "0x92ba0fd39658105fac4df2b9bade998b5816b350"  # Locked (temporary)
+FLUSH_REWARDER = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"  # Locked (rewardsAvailable)
 
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 TYPE_NAMES = {0: "LATP", 1: "MATP", 2: "NCATP"}
@@ -125,6 +126,7 @@ SEL_GET_CANONICAL_ROLLUP = sel("getCanonicalRollup()")
 SEL_GET_REWARD_DISTRIBUTOR = sel("getRewardDistributor()")
 SEL_GET_GSE = sel("getGSE()")
 SEL_IS_REWARDS_CLAIMABLE = sel("isRewardsClaimable()")
+SEL_REWARDS_AVAILABLE = sel("rewardsAvailable()")
 SEL_AGGREGATE3 = sel("aggregate3((address,bool,bytes)[])")
 
 
@@ -366,6 +368,9 @@ def fetch_data(atps, contract_addrs):
     for f in FACTORIES:
         calls.append((AZTEC_TOKEN, _encode_bal(f)))
 
+    # [...] FlushRewarder: rewardsAvailable() = locked rewards
+    calls.append((FLUSH_REWARDER, SEL_REWARDS_AVAILABLE))
+
     # [...] Global unlock schedule from first ATP
     global_lock_idx = len(calls)
     if atps:
@@ -442,6 +447,10 @@ def fetch_data(atps, contract_addrs):
         factory_bals[f] = _u256(idx)
         idx += 1
 
+    # FlushRewarder: rewardsAvailable() returns locked rewards (in wei)
+    flush_rewarder_locked = _u256(idx)
+    idx += 1
+
     # Global lock
     global_lock = None
     if atps:
@@ -502,6 +511,7 @@ def fetch_data(atps, contract_addrs):
         "other_bals": other_bals,
         "token_sale_balance": token_sale_balance,
         "factory_bals": factory_bals,
+        "flush_rewarder_locked": flush_rewarder_locked,
     }
 
 
@@ -603,6 +613,9 @@ def display(atps, data):
     # These funds remain in the rollup contract permanently
     locked_slashed = total_slashed_funds
 
+    # FlushRewarder: rewardsAvailable() = pending rewards not yet distributed
+    locked_flush_rewarder = data["flush_rewarder_locked"]
+
     # Sum governance balances (all historical instances)
     total_governance_balance = sum(governance_bals.values())
 
@@ -618,6 +631,7 @@ def display(atps, data):
         + locked_factories
         + locked_rollup_rewards
         + locked_slashed
+        + locked_flush_rewarder
     )
     circulating = total_supply - total_locked
 
@@ -687,6 +701,12 @@ def display(atps, data):
             f"    Slashed Funds:     {fmt(locked_slashed):>27} AZTEC"
             f"  ({pct(locked_slashed, total_supply)})"
             f"  [permanently locked in Governance]"
+        )
+    if locked_flush_rewarder > 0:
+        print(
+            f"    Flush Rewarder:    {fmt(locked_flush_rewarder):>27} AZTEC"
+            f"  ({pct(locked_flush_rewarder, total_supply)})"
+            f"  [pending rewards]"
         )
 
     print(f"\n  {'─'*54}")
