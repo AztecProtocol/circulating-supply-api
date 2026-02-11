@@ -13,7 +13,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket = "aztec-foundation-terraform-state"
+    bucket = "aztec-circ-supply-terraform"
     key    = "circulating-supply-api"
     region = "eu-west-2"
   }
