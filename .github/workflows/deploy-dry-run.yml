@@ -1,23 +1,25 @@
-name: Deploy
+name: Deploy (dry run)
 
 on:
-  push:
+  workflow_dispatch:
+  pull_request:
     branches: [main]
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: deploy-dry-run-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: read
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ENVIRONMENT: prod
   TF_DIR: terraform
 
 jobs:
-  deploy:
+  deploy-dry-run:
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -39,7 +41,7 @@ jobs:
       - name: Install Poetry
         run: pip install poetry poetry-plugin-export
 
-      - name: Build Lambda layer
+      - name: Build Lambda layer (local only)
         run: |
           mkdir -p build/lambda-layer/python
           poetry export -f requirements.txt --without-hashes -o build/requirements.txt
@@ -52,16 +54,11 @@ jobs:
           cd build/lambda-layer
           zip -r ../python-deps.zip python/ > /dev/null
 
-      - name: Upload Lambda layer to S3
-        run: |
-          BUCKET="aztec-supply-lambda-artifacts-${ENVIRONMENT}"
-          aws s3 cp build/python-deps.zip "s3://${BUCKET}/layers/python-deps.zip"
-
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform init \
-            -backend-config="bucket=aztec-foundation-terraform-state" \
+            -backend-config="bucket=aztec-circ-supply-terraform" \
             -backend-config="key=circulating-supply-api" \
             -backend-config="region=${AWS_REGION}"
 
@@ -73,18 +70,4 @@ jobs:
           TF_VAR_route53_zone_id: ${{ secrets.ROUTE53_ZONE_ID }}
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
           TF_VAR_environment: ${{ env.ENVIRONMENT }}
-
-      - name: Terraform apply
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform apply -input=false tfplan
-
-      - name: Smoke test
-        run: |
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://supply.aztec.network/ || true)
-          if [ "$STATUS" = "200" ]; then
-            echo "API returned 200 OK"
-          else
-            echo "Warning: API returned $STATUS (may need time for DNS propagation)"
-          fi
 

@@ -13,14 +13,13 @@ terraform {
   }
 
   backend "s3" {
-    bucket = "aztec-foundation-terraform-state"
+    bucket = "aztec-circ-supply-terraform"
     key    = "circulating-supply-api"
     region = "eu-west-2"
   }
 }
 
 provider "aws" {
-  profile = "foundation"
   region = var.aws_region
 
   default_tags {
@@ -34,9 +33,8 @@ provider "aws" {
 
 # ACM certificates for CloudFront must be in us-east-1
 provider "aws" {
-  alias   = "us_east_1"
-  profile = "foundation"
-  region  = "us-east-1"
+  alias  = "us_east_1"
+  region = "us-east-1"
 
   default_tags {
     tags = {
