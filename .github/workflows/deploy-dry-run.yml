@@ -14,13 +14,14 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: eu-west-2
+  AWS_REGION: ${{ vars.AWS_REGION }}
   ENVIRONMENT: prod
   TF_DIR: terraform
 
 jobs:
   deploy-dry-run:
     runs-on: ubuntu-latest
+    environment: prod
     steps:
       - uses: actions/checkout@v4
 
