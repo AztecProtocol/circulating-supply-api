@@ -2,3 +2,9 @@ terraform.tfvars
 __pycache__/
 build/
 .venv/
+
+__pycache__/
+ignition_contracts/
+aztec-packages/
+
+.env

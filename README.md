@@ -26,20 +26,31 @@ Total supply is read from `totalSupply()` on the AZTEC token contract. Everythin
 
 ### ATP Vesting (LATP / MATP / NCATP)
 
-Aztec Token Positions (ATPs) are vesting contracts created by factory contracts. Each ATP has an allocation and follows a global unlock schedule. There are three types:
+Aztec Token Positions (ATPs) are vesting contracts created by factory contracts. Each factory has its **own Registry** with its own global unlock schedule (`unlockStartTime`). There are three ATP types with different unlock rules:
 
-- **LATP** (Linear ATP) / **MATP** (Milestone ATP): `locked = allocation - max(unlocked_by_schedule, claimed)`. The global vesting schedule defines a start, cliff, and end date with linear unlocking.
-- **NCATP** (Non-Claimable ATP): Locked until a `WITHDRAWAL_TIMESTAMP` cliff. Before that timestamp, 100% locked. After, 0%.
+- **LATP** (Linear ATP, type 0): `unlocked = getClaimable() + getClaimed()`. Also fully unlocked if the factory's global lock has ended (`frac >= 1.0`) or the best available `WITHDRAWAL_TIMESTAMP` has passed. The `getClaimable()` check alone is insufficient because it returns `min(balanceOf(ATP), unlocked_by_schedule)` — when tokens are staked out the balance is low and understates the unlocked amount.
+- **MATP** (Milestone ATP, type 1): Indefinitely locked until milestone is approved by the Registry owner (reflected in `getClaimable()`), or the best available `WITHDRAWAL_TIMESTAMP` has passed. The global lock ending does **not** unlock MATPs — milestones must be explicitly approved.
+- **NCATP** (Non-Claimable ATP, type 2): `claim()` always reverts. Only unlockable via `withdrawAllTokensToBeneficiary()` on the staker contract when `WITHDRAWAL_TIMESTAMP` has passed. Before that, 100% locked.
 
-Tokens from ATPs can be staked into Governance/Rollup contracts — staked tokens are still counted as locked based on the original ATP vesting schedule, not their current location.
+For all types, if a staker supports `withdrawAllTokensToBeneficiary()` and its `WITHDRAWAL_TIMESTAMP` has passed, the ATP is considered fully unlocked.
+
+### WITHDRAWAL_TIMESTAMP Discovery
+
+Each factory's Registry tracks multiple staker implementation versions. The calculator checks **all** withdrawal-capable staker implementations (not just the ATP's current staker) and uses the earliest `WITHDRAWAL_TIMESTAMP` for each factory. This accounts for the fact that users may not have upgraded their ATP's staker to the version with the most beneficial timestamp — but they *could* upgrade, so the tokens are considered unlockable.
+
+The discovery process:
+1. `Factory.getRegistry()` → token registry address
+2. `Registry.getNextStakerVersion()` → number of staker versions
+3. `Registry.getStakerImplementation(v)` for each version → implementation addresses
+4. Check each implementation's bytecode for `withdrawAllTokensToBeneficiary()` selector
+5. Query `WITHDRAWAL_TIMESTAMP` on each withdrawal-capable implementation
+6. Use the earliest timestamp per factory for all ATPs from that factory
 
 ### ATP Staking and Token Flow
 
 ATP tokens don't always stay in the ATP contract. The flow is: **ATP → Staker → Governance / Rollup**. When a beneficiary stakes, tokens move out of the ATP into a Staker contract and then into Governance or Rollup. This means the ATP's `balanceOf` can be less than its allocation.
 
-The calculator accounts for this by computing staked tokens as `allocation - claimed - balanceOf(ATP)`. The locked amount is always derived from the original allocation and vesting schedule, regardless of where the tokens physically sit. This prevents double-counting: tokens staked into Governance/Rollup are not separately counted as locked — they're already covered by the ATP's locked calculation.
-
-For NCATPs specifically, the Staker contract is an `ATPWithdrawableAndClaimableStaker` where `claim()` always reverts. Tokens can only exit via `withdrawAllTokensToBeneficiary()`, which is gated by `WITHDRAWAL_TIMESTAMP`. The calculator reads this timestamp from each NCATP's staker to determine the unlock cliff.
+The calculator accounts for this by computing staked tokens as `allocation - claimed - balanceOf(ATP)`. The locked amount is always derived from the original allocation and unlock rules, regardless of where the tokens physically sit. This prevents double-counting: tokens staked into Governance/Rollup are not separately counted as locked — they're already covered by the ATP's locked calculation.
 
 ### Other Locked Contracts
 
@@ -48,11 +59,11 @@ For NCATPs specifically, the Staker contract is an `ATPWithdrawableAndClaimableS
 | **Future Incentives** | Full balance of `0x662D...` — governance-controlled, not circulating |
 | **Y1 Network Rewards** | Full balance of `0x3D6A...` — reserved for year-1 rewards |
 | **Investor Wallet** | Full balance of `0x92ba...` — temporary holding wallet |
-| **Token Sale contract** | Full balance of `0x4B00...` — locked until `isRewardsClaimable()` returns true on the canonical rollup |
-| **Rollup Rewards** | Balance in rollup contracts minus slashed funds — locked until `isRewardsClaimable()` |
 | **Slashed Funds** | Sum of all `Slashed` events from rollup contracts — permanently locked |
 | **Flush Rewarder** | `rewardsAvailable()` on `0x7C9a...` — pending rewards not yet distributed |
 | **Factory balances** | Any remaining balance in factory contracts |
+
+**Not locked:** Token Sale contract balance and rollup rewards are considered circulating (not subtracted from supply).
 
 ## Mapping to Whitepaper Token Distribution
 
