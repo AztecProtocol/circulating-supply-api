@@ -4,7 +4,7 @@ build/
 .venv/
 
 __pycache__/
-ignition_contracts/
+ignition-contracts/
 aztec-packages/
 
 .env
