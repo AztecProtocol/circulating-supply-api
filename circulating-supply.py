@@ -770,6 +770,7 @@ def display(atps, data):
         + locked_factories
         + locked_slashed
         + locked_flush_rewarder
+        + locked_flush_rewarder
     )
     circulating = total_supply - total_locked
 
@@ -827,6 +828,12 @@ def display(atps, data):
             f"    Slashed Funds:     {fmt(locked_slashed):>27} AZTEC"
             f"  ({pct(locked_slashed, total_supply)})"
             f"  [permanently locked in Governance]"
+        )
+    if locked_flush_rewarder > 0:
+        print(
+            f"    Flush Rewarder:    {fmt(locked_flush_rewarder):>27} AZTEC"
+            f"  ({pct(locked_flush_rewarder, total_supply)})"
+            f"  [pending rewards]"
         )
     if locked_flush_rewarder > 0:
         print(
