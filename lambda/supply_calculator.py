@@ -45,32 +45,44 @@ def calculate_supply():
 
         # Compute per-ATP locked amounts (same logic as display())
         now = int(time.time())
-        global_lock = data["global_lock"]
-        frac = unlock_frac(global_lock, now) if global_lock else 0.0
+        factory_global_locks = data["factory_global_locks"]
+        factory_fracs = {f: unlock_frac(lock, now) for f, lock in factory_global_locks.items()}
 
         for a in atps:
             wts = a.get("withdrawal_ts")
-            if a["atp_type"] == 2 and wts is not None:
-                a["locked"] = a["allocation"] if now < wts else 0
+            frac = factory_fracs.get(a["factory"], 0.0)
+            if a["atp_type"] == 2:
+                # NCATP: claim() always reverts, only unlockable via staker withdrawal
+                if wts is not None and now >= wts:
+                    a["locked"] = 0
+                else:
+                    a["locked"] = a["allocation"]
+            elif a["atp_type"] == 1:
+                # MATP: indefinitely locked until milestone approved or staker withdrawal
+                unlocked = a.get("claimable", 0) + a["claimed"]
+                if unlocked >= a["allocation"]:
+                    a["locked"] = 0
+                elif wts is not None and now >= wts:
+                    a["locked"] = 0
+                else:
+                    a["locked"] = max(0, a["allocation"] - unlocked)
             else:
-                unlocked_by_schedule = int(a["allocation"] * frac)
-                a["locked"] = max(
-                    0, a["allocation"] - max(unlocked_by_schedule, a["claimed"])
-                )
+                # LATP: use earliest of global lock end or WITHDRAWAL_TIMESTAMP
+                unlocked = a.get("claimable", 0) + a["claimed"]
+                if unlocked >= a["allocation"]:
+                    a["locked"] = 0
+                elif frac >= 1.0:
+                    a["locked"] = 0
+                elif wts is not None and now >= wts:
+                    a["locked"] = 0
+                else:
+                    a["locked"] = max(0, a["allocation"] - unlocked)
 
         total_atp_locked = sum(a["locked"] for a in atps)
         locked_future_incentives = data["other_bals"].get("Future Incentives", 0)
         locked_y1_rewards = data["other_bals"].get("Y1 Network Rewards", 0)
         locked_investor_wallet = data["other_bals"].get("Investor Wallet", 0)
         locked_factories = sum(data["factory_bals"].values())
-
-        # Token Sale contract balance - locked until isRewardsClaimable
-        locked_token_sale = data["token_sale_balance"] if not data["is_rewards_claimable"] else 0
-
-        # Rollup rewards
-        total_rollup_balance = sum(data["rollup_bals"].values())
-        rollup_rewards_only = max(0, total_rollup_balance - data["total_slashed_funds"])
-        locked_rollup_rewards = rollup_rewards_only if not data["is_rewards_claimable"] else 0
 
         # Slashed funds
         locked_slashed = data["total_slashed_funds"]
@@ -83,9 +95,7 @@ def calculate_supply():
             + locked_future_incentives
             + locked_y1_rewards
             + locked_investor_wallet
-            + locked_token_sale
             + locked_factories
-            + locked_rollup_rewards
             + locked_slashed
             + locked_flush_rewarder
         )
@@ -117,9 +127,7 @@ def calculate_supply():
                 "future_incentives": str(locked_future_incentives),
                 "y1_rewards": str(locked_y1_rewards),
                 "investor_wallet": str(locked_investor_wallet),
-                "token_sale": str(locked_token_sale),
                 "factories": str(locked_factories),
-                "rollup_rewards": str(locked_rollup_rewards),
                 "slashed_funds": str(locked_slashed),
                 "flush_rewarder": str(locked_flush_rewarder),
             }

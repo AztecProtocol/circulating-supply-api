@@ -7,9 +7,11 @@ accounts for tokens staked from ATPs into governance/rollup, and includes
 other locked contract balances to compute the true circulating supply.
 
 Token flow: ATP -> Staker (transient) -> Governance / Rollup
-LATP/MATP: locked = allocation - max(unlocked_by_schedule, getClaimed())
-NCATP w/ ATPWithdrawableAndClaimableStaker: locked by WITHDRAWAL_TIMESTAMP cliff
-  (NCATP.claim() always reverts; tokens exit via withdrawAllTokensToBeneficiary)
+LATP/MATP: locked = allocation - (getClaimable() + getClaimed())
+  getClaimable() already checks global lock schedule and milestone status.
+  If staker supports withdrawAllTokensToBeneficiary and WITHDRAWAL_TIMESTAMP passed → fully unlocked.
+NCATP: locked = allocation (claim() always reverts)
+  Only unlockable via staker withdrawAllTokensToBeneficiary when WITHDRAWAL_TIMESTAMP passed.
 
 Usage:
     python circulating-supply.py
@@ -119,6 +121,7 @@ SEL_TOTAL_SUPPLY = sel("totalSupply()")
 SEL_GET_GLOBAL_LOCK = sel("getGlobalLock()")
 SEL_GET_TYPE = sel("getType()")
 SEL_GET_CLAIMED = sel("getClaimed()")
+SEL_GET_CLAIMABLE = sel("getClaimable()")
 SEL_GET_STAKER = sel("getStaker()")
 SEL_WITHDRAWAL_TS = sel("WITHDRAWAL_TIMESTAMP()")
 SEL_GET_GOVERNANCE = sel("getGovernance()")
@@ -127,6 +130,13 @@ SEL_GET_REWARD_DISTRIBUTOR = sel("getRewardDistributor()")
 SEL_GET_GSE = sel("getGSE()")
 SEL_IS_REWARDS_CLAIMABLE = sel("isRewardsClaimable()")
 SEL_REWARDS_AVAILABLE = sel("rewardsAvailable()")
+SEL_GET_FACTORY_REGISTRY = sel("getRegistry()")
+SEL_GET_NEXT_STAKER_VER = sel("getNextStakerVersion()")
+SEL_GET_STAKER_IMPL = sel("getStakerImplementation(uint256)")
+SEL_WITHDRAW_ALL_TO_BENEFICIARY = sel("withdrawAllTokensToBeneficiary()")
+SEL_GET_ACTIVE_ATTESTER_COUNT = sel("getActiveAttesterCount()")
+SEL_GET_ATTESTER_AT_INDEX = sel("getAttesterAtIndex(uint256)")
+SEL_GET_ATTESTER_VIEW = sel("getAttesterView(address)")
 SEL_AGGREGATE3 = sel("aggregate3((address,bool,bytes)[])")
 
 
@@ -371,15 +381,23 @@ def fetch_data(atps, contract_addrs):
     # [...] FlushRewarder: rewardsAvailable() = locked rewards
     calls.append((FLUSH_REWARDER, SEL_REWARDS_AVAILABLE))
 
-    # [...] Global unlock schedule from first ATP
+    # [...] Global unlock schedule per factory (each factory has its own Registry)
+    # Read getGlobalLock() from one representative ATP per factory
+    factory_first_atp = {}
+    for a in atps:
+        f = a["factory"]
+        if f not in factory_first_atp:
+            factory_first_atp[f] = a["address"]
+    global_lock_factories = list(factory_first_atp.keys())
     global_lock_idx = len(calls)
-    if atps:
-        calls.append((atps[0]["address"], SEL_GET_GLOBAL_LOCK))
+    for f in global_lock_factories:
+        calls.append((factory_first_atp[f], SEL_GET_GLOBAL_LOCK))
 
-    # Per-ATP calls: balanceOf, getClaimed, getType, getStaker
+    # Per-ATP calls: balanceOf, getClaimed, getClaimable, getType, getStaker
     for a in atps:
         calls.append((AZTEC_TOKEN, _encode_bal(a["address"])))
         calls.append((a["address"], SEL_GET_CLAIMED))
+        calls.append((a["address"], SEL_GET_CLAIMABLE))
         calls.append((a["address"], SEL_GET_TYPE))
         calls.append((a["address"], SEL_GET_STAKER))
 
@@ -451,13 +469,13 @@ def fetch_data(atps, contract_addrs):
     flush_rewarder_locked = _u256(idx)
     idx += 1
 
-    # Global lock
-    global_lock = None
-    if atps:
+    # Per-factory global locks
+    factory_global_locks = {}
+    for f in global_lock_factories:
         ok, d = results[idx]
         idx += 1
         if ok and len(d) >= 128:
-            global_lock = decode(["(uint256,uint256,uint256,uint256)"], d)[0]
+            factory_global_locks[f] = decode(["(uint256,uint256,uint256,uint256)"], d)[0]
 
     # Per-ATP data
     for a in atps:
@@ -465,22 +483,123 @@ def fetch_data(atps, contract_addrs):
         idx += 1
         a["claimed"] = _u256(idx)
         idx += 1
+        a["claimable"] = _u256(idx)
+        idx += 1
         a["atp_type"] = _u8(idx)
         idx += 1
         a["staker"] = _addr(idx)
         idx += 1
 
-    # Follow-up: query WITHDRAWAL_TIMESTAMP on NCATP stakers
-    ncatps = [a for a in atps if a["atp_type"] == 2 and a["staker"]]
-    if ncatps:
-        ts_calls = [(a["staker"], SEL_WITHDRAWAL_TS) for a in ncatps]
-        print(f"  Querying WITHDRAWAL_TIMESTAMP for {len(ncatps)} NCATPs...")
-        ts_results = multicall_chunked(ts_calls)
-        for a, (ok, d) in zip(ncatps, ts_results):
+    # Follow-up: discover withdrawal-capable staker implementations from factory registries
+    # Factory → getRegistry() → token registry
+    # Token registry → getNextStakerVersion() → version count
+    # Token registry → getStakerImplementation(v) → implementation address
+    # Check implementation bytecode for withdrawAllTokensToBeneficiary() selector
+    print(f"\n  Checking factory registries for withdrawal-capable staker implementations...")
+
+    # Step 1: Get token registry for each factory
+    reg_calls = [(f, SEL_GET_FACTORY_REGISTRY) for f in FACTORIES]
+    reg_results = multicall(reg_calls)
+    factory_registries = {}
+    for f, (ok, d) in zip(FACTORIES, reg_results):
+        if ok and len(d) >= 32:
+            addr = decode(["address"], d)[0]
+            if int(addr, 16) != 0:
+                factory_registries[f] = to_checksum_cached(addr)
+
+    # Step 2: Get next staker version from each unique registry
+    withdrawal_capable_factories = set()
+    unique_regs = list(set(factory_registries.values()))
+    if unique_regs:
+        ver_calls = [(r, SEL_GET_NEXT_STAKER_VER) for r in unique_regs]
+        ver_results = multicall(ver_calls)
+        reg_next_ver = {}
+        for r, (ok, d) in zip(unique_regs, ver_results):
             if ok and len(d) >= 32:
-                a["withdrawal_ts"] = decode(["uint256"], d)[0]
+                next_ver = decode(["uint256"], d)[0]
+                if next_ver > 0:
+                    reg_next_ver[r] = next_ver
+
+        # Step 3: Get staker implementation for each version
+        impl_calls = []
+        impl_meta = []  # (registry, version)
+        for r, next_ver in reg_next_ver.items():
+            for v in range(next_ver):
+                impl_calls.append((r, SEL_GET_STAKER_IMPL + encode(["uint256"], [v])))
+                impl_meta.append((r, v))
+
+        if impl_calls:
+            impl_results = multicall(impl_calls)
+            # Collect unique implementations and which registries they belong to
+            impl_to_regs = {}
+            for (r, v), (ok, d) in zip(impl_meta, impl_results):
+                if ok and len(d) >= 32:
+                    impl_addr = decode(["address"], d)[0]
+                    if int(impl_addr, 16) != 0:
+                        impl_addr = to_checksum_cached(impl_addr)
+                        impl_to_regs.setdefault(impl_addr, set()).add(r)
+
+            # Step 4: Check each implementation's bytecode for withdrawAllTokensToBeneficiary
+            # and query WITHDRAWAL_TIMESTAMP from each withdrawal-capable implementation
+            print(f"    Found {len(impl_to_regs)} unique staker implementation(s), checking bytecode...")
+            withdrawal_capable_impls = {}  # impl_addr -> set of registries
+            for impl_addr, regs in impl_to_regs.items():
+                code = retry(lambda a=impl_addr: w3.eth.get_code(to_checksum_cached(a)))
+                if SEL_WITHDRAW_ALL_TO_BENEFICIARY in bytes(code):
+                    print(f"    {impl_addr} has withdrawAllTokensToBeneficiary")
+                    withdrawal_capable_impls[impl_addr] = regs
+                    for f, r in factory_registries.items():
+                        if r in regs:
+                            withdrawal_capable_factories.add(f.lower())
+
+    if withdrawal_capable_factories:
+        print(f"    {len(withdrawal_capable_factories)} factory(ies) have withdrawal-capable stakers")
+    else:
+        print(f"    No withdrawal-capable staker implementations found")
+
+    # Step 5: Query WITHDRAWAL_TIMESTAMP from each withdrawal-capable staker implementation
+    # Use the BEST (earliest passed) timestamp for each factory, since users can upgrade
+    # to any available staker version — not just the one they're currently using.
+    now_ts = int(time.time())
+    factory_best_withdrawal_ts = {}  # factory (lower) -> earliest WITHDRAWAL_TIMESTAMP
+    if withdrawal_capable_impls:
+        impl_addrs = list(withdrawal_capable_impls.keys())
+        print(f"    Querying WITHDRAWAL_TIMESTAMP from {len(impl_addrs)} withdrawal-capable implementation(s)...")
+        ts_calls = [(addr, SEL_WITHDRAWAL_TS) for addr in impl_addrs]
+        ts_results = multicall(ts_calls)
+        for impl_addr, (ok, d) in zip(impl_addrs, ts_results):
+            if ok and len(d) >= 32:
+                ts = decode(["uint256"], d)[0]
+                if ts > 0:
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    status = "PASSED" if now_ts >= ts else "FUTURE"
+                    print(f"    {impl_addr}: WITHDRAWAL_TIMESTAMP {dt.strftime('%Y-%m-%d %H:%M UTC')} [{status}]")
+                    # Map this timestamp to all factories using this implementation's registry
+                    regs = withdrawal_capable_impls[impl_addr]
+                    for f, r in factory_registries.items():
+                        if r in regs:
+                            f_lower = f.lower()
+                            if f_lower not in factory_best_withdrawal_ts or ts < factory_best_withdrawal_ts[f_lower]:
+                                factory_best_withdrawal_ts[f_lower] = ts
+                else:
+                    print(f"    {impl_addr}: WITHDRAWAL_TIMESTAMP = 0 (not set)")
             else:
-                a["withdrawal_ts"] = None
+                print(f"    {impl_addr}: WITHDRAWAL_TIMESTAMP call failed")
+
+    # Apply the best WITHDRAWAL_TIMESTAMP to all ATPs from withdrawal-capable factories
+    for a in atps:
+        f_lower = a.get("factory", "").lower()
+        if f_lower in factory_best_withdrawal_ts:
+            best_ts = factory_best_withdrawal_ts[f_lower]
+            a["withdrawal_ts"] = best_ts
+        # No withdrawal_ts means the factory has no withdrawal-capable staker implementations
+
+    if factory_best_withdrawal_ts:
+        for f_lower, ts in factory_best_withdrawal_ts.items():
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            status = "PASSED" if now_ts >= ts else "FUTURE"
+            factory_name = f_lower[:10]
+            print(f"    {factory_name}: best WITHDRAWAL_TIMESTAMP = {dt.strftime('%Y-%m-%d %H:%M UTC')} [{status}]")
 
     # Follow-up: query Slashed events from all historical rollup contracts
     # When slashing occurs, the slashed amount stays in the rollup contract permanently
@@ -500,9 +619,54 @@ def fetch_data(atps, contract_addrs):
     else:
         print(f"    No slashing events found")
 
+    # Follow-up: query actively staked tokens on the current rollup
+    # Enumerate all active attesters and sum their effectiveBalance (status == VALIDATING only)
+    print(f"\n  Querying actively staked tokens on rollup...")
+    actively_staked_rollup = 0
+    attester_count = 0
+
+    # Step 1: Get active attester count
+    count_result = multicall([(current_rollup, SEL_GET_ACTIVE_ATTESTER_COUNT)])
+    if count_result[0][0] and len(count_result[0][1]) >= 32:
+        attester_count = decode(["uint256"], count_result[0][1])[0]
+    print(f"    Active attester count: {attester_count}")
+
+    if attester_count > 0:
+        # Step 2: Get all attester addresses
+        index_calls = [
+            (current_rollup, SEL_GET_ATTESTER_AT_INDEX + encode(["uint256"], [i]))
+            for i in range(attester_count)
+        ]
+        index_results = multicall_chunked(index_calls)
+        attesters = []
+        for ok, d in index_results:
+            if ok and len(d) >= 32:
+                attesters.append(decode(["address"], d)[0])
+
+        # Step 3: Get AttesterView for each attester (status + effectiveBalance)
+        # AttesterView ABI: (uint8 status, uint256 effectiveBalance, Exit exit, AttesterConfig config)
+        # We only need the first 64 bytes: status (uint8) + effectiveBalance (uint256)
+        view_calls = [
+            (current_rollup, SEL_GET_ATTESTER_VIEW + encode(["address"], [to_checksum_cached(a)]))
+            for a in attesters
+        ]
+        view_results = multicall_chunked(view_calls)
+
+        validating_count = 0
+        for (ok, d) in view_results:
+            if ok and len(d) >= 64:
+                status = decode(["uint8"], d[:32])[0]
+                effective_balance = decode(["uint256"], d[32:64])[0]
+                if status == 1:  # VALIDATING
+                    actively_staked_rollup += effective_balance
+                    validating_count += 1
+
+        print(f"    Validating attesters: {validating_count}")
+        print(f"    Actively staked: {fmt(actively_staked_rollup)} AZTEC")
+
     return {
         "total_supply": total_supply,
-        "global_lock": global_lock,
+        "factory_global_locks": factory_global_locks,
         "is_rewards_claimable": is_rewards_claimable,
         "total_slashed_funds": total_slashed_funds,
         "governance_bals": governance_bals,
@@ -512,6 +676,8 @@ def fetch_data(atps, contract_addrs):
         "token_sale_balance": token_sale_balance,
         "factory_bals": factory_bals,
         "flush_rewarder_locked": flush_rewarder_locked,
+        "factory_best_withdrawal_ts": factory_best_withdrawal_ts,
+        "actively_staked_rollup": actively_staked_rollup,
     }
 
 
@@ -542,7 +708,7 @@ def unlock_frac(lock, ts):
 def display(atps, data):
     # Unpack data
     total_supply = data["total_supply"]
-    global_lock = data["global_lock"]
+    factory_global_locks = data["factory_global_locks"]
     is_rewards_claimable = data["is_rewards_claimable"]
     total_slashed_funds = data["total_slashed_funds"]
     governance_bals = data["governance_bals"]
@@ -554,24 +720,53 @@ def display(atps, data):
 
     now = int(time.time())
     block = retry(lambda: w3.eth.block_number)
-    frac = unlock_frac(global_lock, now) if global_lock else 0.0
+
+    # Per-factory unlock fractions (each factory has its own Registry with its own schedule)
+    factory_fracs = {}
+    for f, lock in factory_global_locks.items():
+        factory_fracs[f] = unlock_frac(lock, now)
 
     # ── Compute locked amounts per ATP ──
-    # LATP/MATP: locked = max(0, allocation - max(unlocked_by_schedule, claimed))
-    # NCATP with WITHDRAWAL_TIMESTAMP: before = fully locked, after = fully unlocked
-    # (NCATP.claim() always reverts; tokens exit via withdrawAllTokensToBeneficiary)
+    # LATP/MATP:
+    #   1. unlocked = getClaimable() + getClaimed()  (getClaimable checks global lock & milestones)
+    #   2. If staker supports withdrawAllTokensToBeneficiary and WITHDRAWAL_TIMESTAMP passed → all unlocked
+    #   3. locked = allocation - unlocked
+    #   MATPs are effectively indefinitely locked until milestone is approved by Registry owner,
+    #   since getClaimable() returns 0 for pending milestones.
+    # NCATP:
+    #   claim() always reverts — only unlockable via staker withdrawAllTokensToBeneficiary
+    #   when WITHDRAWAL_TIMESTAMP has passed.
     for a in atps:
         wts = a.get("withdrawal_ts")
-        if a["atp_type"] == 2 and wts is not None:
-            # NCATP with ATPWithdrawableAndClaimableStaker:
-            # WITHDRAWAL_TIMESTAMP acts as a cliff unlock date
-            a["locked"] = a["allocation"] if now < wts else 0
+        frac = factory_fracs.get(a["factory"], 0.0)
+        if a["atp_type"] == 2:
+            # NCATP: claim() always reverts, only unlockable via staker withdrawal
+            if wts is not None and now >= wts:
+                a["locked"] = 0
+            else:
+                a["locked"] = a["allocation"]
+        elif a["atp_type"] == 1:
+            # MATP: indefinitely locked until milestone approved or staker withdrawal
+            # getClaimable() returns 0 for pending milestones regardless of global lock
+            unlocked = a.get("claimable", 0) + a["claimed"]
+            if unlocked >= a["allocation"]:
+                a["locked"] = 0
+            elif wts is not None and now >= wts:
+                a["locked"] = 0
+            else:
+                a["locked"] = max(0, a["allocation"] - unlocked)
         else:
-            # LATP / MATP / NCATP without withdrawal staker: use global schedule
-            unlocked_by_schedule = int(a["allocation"] * frac)
-            a["locked"] = max(
-                0, a["allocation"] - max(unlocked_by_schedule, a["claimed"])
-            )
+            # LATP: use earliest of global lock end or WITHDRAWAL_TIMESTAMP
+            # getClaimable() is capped by balance, so also check if global lock fully ended
+            unlocked = a.get("claimable", 0) + a["claimed"]
+            if unlocked >= a["allocation"]:
+                a["locked"] = 0
+            elif frac >= 1.0:
+                a["locked"] = 0
+            elif wts is not None and now >= wts:
+                a["locked"] = 0
+            else:
+                a["locked"] = max(0, a["allocation"] - unlocked)
         # Tokens staked out of the ATP (in governance/rollup/staker)
         a["staked"] = max(0, a["allocation"] - a["claimed"] - a["balance"])
 
@@ -596,18 +791,12 @@ def display(atps, data):
     locked_investor_wallet = other_bals.get("Investor Wallet", 0)
     locked_factories = sum(factory_bals.values())
 
-    # Token Sale contract balance - locked until isRewardsClaimable
-    # (This is separate from Token Sale ATPs, which follow the ATP schedule)
-    locked_token_sale = token_sale_balance if not is_rewards_claimable else 0
-
     # Rollup balance breakdown (sum of all historical rollup instances):
     # Total rollup balance = ATP-staked + rewards + slashed funds
     # - ATP-staked tokens are already accounted for in ATP locked calculation
-    # - Rewards are locked if not claimable
-    # - Slashed funds are permanently locked (regardless of is_rewards_claimable)
+    # - Rewards are claimable (not locked)
+    # - Slashed funds are permanently locked
     total_rollup_balance = sum(rollup_bals.values())
-    rollup_rewards_only = max(0, total_rollup_balance - total_slashed_funds)
-    locked_rollup_rewards = rollup_rewards_only if not is_rewards_claimable else 0
 
     # Slashed funds: tracked via Slashed events from rollup contracts
     # These funds remain in the rollup contract permanently
@@ -622,14 +811,15 @@ def display(atps, data):
     # Sum GSE balances (all historical instances)
     total_gse_balance = sum(gse_bals.values())
 
+    # Actively staked on rollup: sum of effectiveBalance for VALIDATING attesters
+    actively_staked = data["actively_staked_rollup"]
+
     total_locked = (
         total_atp_locked
         + locked_future_incentives
         + locked_y1_rewards
         + locked_investor_wallet
-        + locked_token_sale
         + locked_factories
-        + locked_rollup_rewards
         + locked_slashed
         + locked_flush_rewarder
     )
@@ -679,22 +869,10 @@ def display(atps, data):
             f"    Investor Wallet:   {fmt(locked_investor_wallet):>27} AZTEC"
             f"  ({pct(locked_investor_wallet, total_supply)})"
         )
-    if locked_token_sale:
-        print(
-            f"    Token Sale:        {fmt(locked_token_sale):>27} AZTEC"
-            f"  ({pct(locked_token_sale, total_supply)})"
-            f"  [locked until rewards claimable]"
-        )
     if locked_factories:
         print(
             f"    Factories:         {fmt(locked_factories):>27} AZTEC"
             f"  ({pct(locked_factories, total_supply)})"
-        )
-    if locked_rollup_rewards > 0:
-        print(
-            f"    Rollup Rewards:    {fmt(locked_rollup_rewards):>27} AZTEC"
-            f"  ({pct(locked_rollup_rewards, total_supply)})"
-            f"  [not yet claimable]"
         )
     if locked_slashed > 0:
         print(
@@ -737,10 +915,9 @@ def display(atps, data):
             print(f"      {addr}: {fmt(bal)}")
 
     # Rollup (sum of all instances)
-    rewards_status = "claimable" if is_rewards_claimable else "locked"
     print(
         f"    {'Rollup (sum):':.<24} {fmt(total_rollup_balance):>22} AZTEC"
-        f"  [ATP staked + rewards ({rewards_status}) + slashed]"
+        f"  [actively staked: {fmt(actively_staked)}, slashed: {fmt(locked_slashed)}]"
     )
     if len(rollup_bals) > 1:
         for addr, bal in rollup_bals.items():
@@ -765,11 +942,8 @@ def display(atps, data):
             locked_label = "  [unlocked]"
         print(f"    {name + ':':.<24} {fmt(bal):>22} AZTEC{locked_label}")
 
-    # Token Sale contract (holds tokens + creates ATPs)
-    token_sale_status = "locked" if not is_rewards_claimable else "unlocked"
     print(
         f"    {'Token Sale:':<24} {fmt(token_sale_balance):>22} AZTEC"
-        f"  [balance {token_sale_status} until rewards claimable]"
     )
 
     print(
@@ -882,72 +1056,44 @@ def display(atps, data):
                 f"  [locked: {fmt(g['locked'])}]{time_str}"
             )
 
-    # ── TGE unlock projection ──
-    # Note: This projection assumes full unlock at TGE for token sale (auction) ATPs,
-    # token sale contract balance, and that rollup rewards become claimable
-    if global_lock:
-        start, cliff, end, _ = global_lock
+    # ── Per-factory unlock status ──
+    print(f"\n{'='*70}")
+    print(f"  PER-FACTORY UNLOCK SCHEDULES")
+    print(f"{'='*70}")
+    factory_labels = {
+        "0x23d5e1fb8315fc3321993c272f3270712e2d5c69": "ATPFactory v1 (insiders)",
+        "0xEB7442dc9392866324421bfe9aC5367AD9Bbb3A6": "ATPFactory v2 (genesis sale)",
+        "0x42Df694EdF32d5AC19A75E1c7f91C982a7F2a161": "Token Sale Factory (auction)",
+        "0xfd6Bde35Ec36906D61c1977C82Dc429E9b009940": "ATPFactory v3 (grants)",
+        "0xFc5344E82C8DEb027F9fbc95F92a94eef91f9afC": "ATPFactory v4 (foundation)",
+        "0x278f39b11b3de0796561e85cb48535c9f45ddfcc": "ATPFactory v5 (investors)",
+    }
+    for f, lock in factory_global_locks.items():
+        label = factory_labels.get(f, f[:10] + "...")
+        frac_f = factory_fracs.get(f, 0.0)
+        s, c, e, _ = lock
+        start_dt = datetime.fromtimestamp(s, tz=timezone.utc).strftime('%Y-%m-%d')
+        end_dt = datetime.fromtimestamp(e, tz=timezone.utc).strftime('%Y-%m-%d')
+        if frac_f >= 1.0:
+            status = "FULLY UNLOCKED"
+        elif now < c:
+            status = f"NOT STARTED ({(c - now) // 86400} days until cliff)"
+        else:
+            status = f"{frac_f*100:.1f}% unlocked"
+        print(f"  {label}: {start_dt} → {end_dt}  [{status}]")
 
-        # Filter Token Sale (auction) ATPs
-        token_sale_factory = "0x42Df694EdF32d5AC19A75E1c7f91C982a7F2a161"
-        token_sale_atps = [a for a in atps if a.get("factory", "").lower() == token_sale_factory.lower()]
-
-        if token_sale_atps or token_sale_balance > 0:
-            print(f"\n{'='*70}")
-            print(f"  TGE UNLOCK PROJECTION (assumes full unlock)")
-            print(f"{'='*70}")
-
-            cliff_dt = datetime.fromtimestamp(cliff, tz=timezone.utc)
-            is_future = now < cliff
-            time_status = "will unlock" if is_future else "unlocked"
-            days_diff = abs(cliff - now) // 86400
-
-            if is_future:
-                time_note = f" ({days_diff} days from now)"
-            elif days_diff < 365:
-                time_note = f" ({days_diff} days ago)"
-            else:
-                time_note = ""
-
-            print(f"  At cliff date ({cliff_dt.strftime('%Y-%m-%d %H:%M UTC')}){time_note}:")
-            print(f"  Assuming 100% unlock for auction/token sale\n")
-
-            # Token Sale ATPs - FULL UNLOCK (100%)
-            total_token_sale_allocation = sum(a["allocation"] for a in token_sale_atps)
-            total_token_sale_unlock = total_token_sale_allocation  # 100% unlock
-            total_token_sale_in_contracts = sum(a["balance"] for a in token_sale_atps)
-            total_token_sale_staked = sum(a["staked"] for a in token_sale_atps)
-
-            print(f"  Token Sale ATPs (Auction):")
-            print(f"    {len(token_sale_atps)} ATPs with {fmt(total_token_sale_allocation)} AZTEC allocated")
-            print(f"    Amount that {time_status} at TGE: {fmt(total_token_sale_unlock)} AZTEC (100%)")
-            print(f"      - In ATP contracts: {fmt(total_token_sale_in_contracts)} AZTEC")
-            print(f"        (can be claimed by beneficiaries)")
-            print(f"      - Staked in Governance/Rollup: {fmt(total_token_sale_staked)} AZTEC")
-            print(f"        (already in use by validators)")
-
-            # Token Sale Contract Balance
-            print(f"\n  Token Sale Contract (direct balance):")
-            print(f"    Balance: {fmt(token_sale_balance)} AZTEC")
-            print(f"    Assumed status at TGE: Unlocked (claimable)")
-            print(f"    Available amount: {fmt(token_sale_balance)} AZTEC")
-
-            # Rollup Rewards - ASSUME CLAIMABLE
-            print(f"\n  Rollup Rewards:")
-            print(f"    Current balance: {fmt(rollup_rewards_only)} AZTEC")
-            print(f"    Assumed status at TGE: Claimable")
-            print(f"    Available to sequencers: {fmt(rollup_rewards_only)} AZTEC")
-
-            # Total TGE unlock - assume all are available
-            total_tge_unlock = total_token_sale_unlock + token_sale_balance + rollup_rewards_only
-
-            print(f"\n  {'─'*54}")
-            print(f"  Total TGE Unlock:      {fmt(total_tge_unlock):>25} AZTEC")
-            print(f"                         ({pct(total_tge_unlock, total_supply)})")
-
-    # ── Global unlock schedule ──
-    if global_lock:
-        start, cliff, end, _ = global_lock
+    # ── Global unlock schedule (use the primary lock — longest remaining) ──
+    # Find the factory with the latest end time that hasn't fully ended
+    primary_lock = None
+    primary_factory = None
+    for f, lock in factory_global_locks.items():
+        if factory_fracs.get(f, 0.0) < 1.0:
+            if primary_lock is None or lock[2] > primary_lock[2]:
+                primary_lock = lock
+                primary_factory = f
+    if primary_lock:
+        start, cliff, end, _ = primary_lock
+        primary_frac = factory_fracs.get(primary_factory, 0.0)
         cliff_days = (cliff - start) // 86400
         total_days = (end - start) // 86400
         total_years = (end - start) / 86400 / 365.25
@@ -970,7 +1116,7 @@ def display(atps, data):
             f" ({total_days} days / {total_years:.1f} yrs)"
         )
 
-        cur_pct = frac * 100
+        cur_pct = primary_frac * 100
         if now < start:
             print(
                 f"\n  Status: NOT STARTED"
@@ -1004,7 +1150,7 @@ def display(atps, data):
                 t = end
 
             if not shown_now and t > now >= cliff:
-                p = unlock_frac(global_lock, now)
+                p = unlock_frac(primary_lock, now)
                 u = int(total_atp_locked * p)
                 dt = datetime.fromtimestamp(now, tz=timezone.utc)
                 print(
@@ -1014,7 +1160,7 @@ def display(atps, data):
                 )
                 shown_now = True
 
-            p = unlock_frac(global_lock, t)
+            p = unlock_frac(primary_lock, t)
             u = int(total_atp_locked * p)
             dt = datetime.fromtimestamp(t, tz=timezone.utc)
             print(
@@ -1067,9 +1213,7 @@ def display(atps, data):
             "future_incentives": str(locked_future_incentives),
             "y1_rewards": str(locked_y1_rewards),
             "investor_wallet": str(locked_investor_wallet),
-            "token_sale": str(locked_token_sale),
             "factories": str(locked_factories),
-            "rollup_rewards": str(locked_rollup_rewards),
             "slashed_funds": str(locked_slashed),
         },
         "is_rewards_claimable": is_rewards_claimable,
@@ -1083,16 +1227,26 @@ def display(atps, data):
             "token_sale": str(token_sale_balance),
             **{name: str(bal) for name, bal in other_bals.items()},
         },
+        "actively_staked": str(actively_staked),
+        "actively_staked_formatted": fmt(actively_staked),
         "atp_count": len(atps),
         "active_atp_count": len(active),
     }
-    if global_lock:
+    if primary_lock:
         result["global_lock"] = {
-            "start": global_lock[0],
-            "cliff": global_lock[1],
-            "end": global_lock[2],
-            "current_unlock_pct": round(frac * 100, 4),
+            "start": primary_lock[0],
+            "cliff": primary_lock[1],
+            "end": primary_lock[2],
+            "current_unlock_pct": round(primary_frac * 100, 4),
         }
+    result["factory_locks"] = {
+        factory_labels.get(f, f): {
+            "start": lock[0],
+            "end": lock[2],
+            "current_unlock_pct": round(factory_fracs.get(f, 0.0) * 100, 4),
+        }
+        for f, lock in factory_global_locks.items()
+    }
     print(f"\n{json.dumps(result, indent=2)}")
 
 
