@@ -134,6 +134,9 @@ SEL_GET_FACTORY_REGISTRY = sel("getRegistry()")
 SEL_GET_NEXT_STAKER_VER = sel("getNextStakerVersion()")
 SEL_GET_STAKER_IMPL = sel("getStakerImplementation(uint256)")
 SEL_WITHDRAW_ALL_TO_BENEFICIARY = sel("withdrawAllTokensToBeneficiary()")
+SEL_GET_ACTIVE_ATTESTER_COUNT = sel("getActiveAttesterCount()")
+SEL_GET_ATTESTER_AT_INDEX = sel("getAttesterAtIndex(uint256)")
+SEL_GET_ATTESTER_VIEW = sel("getAttesterView(address)")
 SEL_AGGREGATE3 = sel("aggregate3((address,bool,bytes)[])")
 
 
@@ -616,6 +619,51 @@ def fetch_data(atps, contract_addrs):
     else:
         print(f"    No slashing events found")
 
+    # Follow-up: query actively staked tokens on the current rollup
+    # Enumerate all active attesters and sum their effectiveBalance (status == VALIDATING only)
+    print(f"\n  Querying actively staked tokens on rollup...")
+    actively_staked_rollup = 0
+    attester_count = 0
+
+    # Step 1: Get active attester count
+    count_result = multicall([(current_rollup, SEL_GET_ACTIVE_ATTESTER_COUNT)])
+    if count_result[0][0] and len(count_result[0][1]) >= 32:
+        attester_count = decode(["uint256"], count_result[0][1])[0]
+    print(f"    Active attester count: {attester_count}")
+
+    if attester_count > 0:
+        # Step 2: Get all attester addresses
+        index_calls = [
+            (current_rollup, SEL_GET_ATTESTER_AT_INDEX + encode(["uint256"], [i]))
+            for i in range(attester_count)
+        ]
+        index_results = multicall_chunked(index_calls)
+        attesters = []
+        for ok, d in index_results:
+            if ok and len(d) >= 32:
+                attesters.append(decode(["address"], d)[0])
+
+        # Step 3: Get AttesterView for each attester (status + effectiveBalance)
+        # AttesterView ABI: (uint8 status, uint256 effectiveBalance, Exit exit, AttesterConfig config)
+        # We only need the first 64 bytes: status (uint8) + effectiveBalance (uint256)
+        view_calls = [
+            (current_rollup, SEL_GET_ATTESTER_VIEW + encode(["address"], [to_checksum_cached(a)]))
+            for a in attesters
+        ]
+        view_results = multicall_chunked(view_calls)
+
+        validating_count = 0
+        for (ok, d) in view_results:
+            if ok and len(d) >= 64:
+                status = decode(["uint8"], d[:32])[0]
+                effective_balance = decode(["uint256"], d[32:64])[0]
+                if status == 1:  # VALIDATING
+                    actively_staked_rollup += effective_balance
+                    validating_count += 1
+
+        print(f"    Validating attesters: {validating_count}")
+        print(f"    Actively staked: {fmt(actively_staked_rollup)} AZTEC")
+
     return {
         "total_supply": total_supply,
         "factory_global_locks": factory_global_locks,
@@ -629,6 +677,7 @@ def fetch_data(atps, contract_addrs):
         "factory_bals": factory_bals,
         "flush_rewarder_locked": flush_rewarder_locked,
         "factory_best_withdrawal_ts": factory_best_withdrawal_ts,
+        "actively_staked_rollup": actively_staked_rollup,
     }
 
 
@@ -762,6 +811,9 @@ def display(atps, data):
     # Sum GSE balances (all historical instances)
     total_gse_balance = sum(gse_bals.values())
 
+    # Actively staked on rollup: sum of effectiveBalance for VALIDATING attesters
+    actively_staked = data["actively_staked_rollup"]
+
     total_locked = (
         total_atp_locked
         + locked_future_incentives
@@ -769,7 +821,6 @@ def display(atps, data):
         + locked_investor_wallet
         + locked_factories
         + locked_slashed
-        + locked_flush_rewarder
         + locked_flush_rewarder
     )
     circulating = total_supply - total_locked
@@ -835,12 +886,6 @@ def display(atps, data):
             f"  ({pct(locked_flush_rewarder, total_supply)})"
             f"  [pending rewards]"
         )
-    if locked_flush_rewarder > 0:
-        print(
-            f"    Flush Rewarder:    {fmt(locked_flush_rewarder):>27} AZTEC"
-            f"  ({pct(locked_flush_rewarder, total_supply)})"
-            f"  [pending rewards]"
-        )
 
     print(f"\n  {'─'*54}")
     print(
@@ -872,7 +917,7 @@ def display(atps, data):
     # Rollup (sum of all instances)
     print(
         f"    {'Rollup (sum):':.<24} {fmt(total_rollup_balance):>22} AZTEC"
-        f"  [ATP staked + rewards (claimable) + slashed]"
+        f"  [actively staked: {fmt(actively_staked)}, slashed: {fmt(locked_slashed)}]"
     )
     if len(rollup_bals) > 1:
         for addr, bal in rollup_bals.items():
@@ -1182,6 +1227,8 @@ def display(atps, data):
             "token_sale": str(token_sale_balance),
             **{name: str(bal) for name, bal in other_bals.items()},
         },
+        "actively_staked": str(actively_staked),
+        "actively_staked_formatted": fmt(actively_staked),
         "atp_count": len(atps),
         "active_atp_count": len(active),
     }
