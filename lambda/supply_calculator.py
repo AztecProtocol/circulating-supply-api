@@ -49,6 +49,9 @@ def calculate_supply():
         type_locked = {"LATP": 0, "MATP": 0, "NCATP": 0}
         type_names = {0: "LATP", 1: "MATP", 2: "NCATP"}
 
+        type_locked = {"LATP": 0, "MATP": 0, "NCATP": 0}
+        type_names = {0: "LATP", 1: "MATP", 2: "NCATP"}
+
         for a in atps:
             wts = a.get("withdrawal_ts")
             atp_type_name = type_names.get(a["atp_type"], "LATP")
@@ -100,6 +103,9 @@ def calculate_supply():
         total_gse_balance = sum(data["gse_bals"].values())
         actively_staked = data["actively_staked_rollup"]
 
+
+        # Get current block
+        block_number = retry(lambda: w3.eth.block_number)
 
         # Format the response
         result = {
