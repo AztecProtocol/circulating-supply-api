@@ -5,7 +5,6 @@ This is a wrapper around the main circulating-supply.py script.
 
 import os
 import sys
-import time
 from datetime import datetime, timezone
 
 # Add parent directory to import the original script
@@ -26,8 +25,7 @@ def calculate_supply():
             fetch_atps,
             fetch_data,
             unlock_frac,
-            w3,
-            retry
+            get_block_info,
         )
 
         print("Discovering contract addresses...")
@@ -45,16 +43,17 @@ def calculate_supply():
         is_rewards_claimable = data["is_rewards_claimable"]
 
         # Compute per-ATP locked amounts (same logic as display())
-        now = int(time.time())
+        block_number, now = get_block_info()
         factory_global_locks = data["factory_global_locks"]
-        factory_fracs = {f: unlock_frac(lock, now) for f, lock in factory_global_locks.items()}
+
+        type_locked = {"LATP": 0, "MATP": 0, "NCATP": 0}
+        type_names = {0: "LATP", 1: "MATP", 2: "NCATP"}
 
         type_locked = {"LATP": 0, "MATP": 0, "NCATP": 0}
         type_names = {0: "LATP", 1: "MATP", 2: "NCATP"}
 
         for a in atps:
             wts = a.get("withdrawal_ts")
-            frac = factory_fracs.get(a["factory"], 0.0)
             atp_type_name = type_names.get(a["atp_type"], "LATP")
             if a["atp_type"] == 2:
                 # NCATP: claim() always reverts, only unlockable via staker withdrawal
@@ -62,21 +61,10 @@ def calculate_supply():
                     a["locked"] = 0
                 else:
                     a["locked"] = a["allocation"]
-            elif a["atp_type"] == 1:
-                # MATP: indefinitely locked until milestone approved or staker withdrawal
-                unlocked = a.get("claimable", 0) + a["claimed"]
-                if unlocked >= a["allocation"]:
-                    a["locked"] = 0
-                elif wts is not None and now >= wts:
-                    a["locked"] = 0
-                else:
-                    a["locked"] = max(0, a["allocation"] - unlocked)
             else:
-                # LATP: use earliest of global lock end or WITHDRAWAL_TIMESTAMP
+                # LATP/MATP: getClaimable() respects both global and local locks
                 unlocked = a.get("claimable", 0) + a["claimed"]
                 if unlocked >= a["allocation"]:
-                    a["locked"] = 0
-                elif frac >= 1.0:
                     a["locked"] = 0
                 elif wts is not None and now >= wts:
                     a["locked"] = 0
@@ -114,6 +102,7 @@ def calculate_supply():
         total_governance_balance = sum(data["governance_bals"].values())
         total_gse_balance = sum(data["gse_bals"].values())
         actively_staked = data["actively_staked_rollup"]
+
 
         # Get current block
         block_number = retry(lambda: w3.eth.block_number)
@@ -162,8 +151,8 @@ def calculate_supply():
         # Add global lock info if available
         if factory_global_locks:
             primary_lock = None
-            for f, lock in factory_global_locks.items():
-                frac = factory_fracs.get(f, 0.0)
+            for _, lock in factory_global_locks.items():
+                frac = unlock_frac(lock, now)
                 if frac < 1.0:
                     if primary_lock is None or lock[2] > primary_lock[2]:
                         primary_lock = lock

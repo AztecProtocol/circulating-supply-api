@@ -41,6 +41,10 @@ if not RPC_URL:
     print("Error: ETH_RPC_URL environment variable is required")
     sys.exit(1)
 
+# Optional: query at a specific historical block (default: latest)
+_eth_block_raw = os.environ.get("ETH_BLOCK", "").strip()
+BLOCK_ID = int(_eth_block_raw) if _eth_block_raw else "latest"
+
 # Bootstrap addresses (only these need to be hardcoded)
 REGISTRY = "0x35b22e09Ee0390539439E24f06Da43D83f90e298"  # All other addresses derived from here
 AZTEC_TOKEN = "0xA27EC0006e59f245217Ff08CD52A7E8b169E62D2"
@@ -75,9 +79,28 @@ FLUSH_REWARDER = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"  # Locked (rewards
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 TYPE_NAMES = {0: "LATP", 1: "MATP", 2: "NCATP"}
 
+# Per-ATP type overrides for contracts where getType() returns the wrong value on-chain.
+# Map ATP address (lowercase) -> correct type. Only affects display labels (locked calc is the same).
+ATP_TYPE_OVERRIDES = {
+    # Two ATPs on grant factory 0xfd6bde35... are LATPs but return getType()=1 (MATP).
+    # Add their addresses here once identified, e.g.:
+    # "0x1234...": 0,  # LATP
+}
+
 # ── Setup ────────────────────────────────────────────────────────────────────
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 120}))
+
+_block_info_cache = {}
+
+
+def get_block_info():
+    """Return (block_number, timestamp) for BLOCK_ID. Cached after first call."""
+    if "info" not in _block_info_cache:
+        blk = retry(lambda: w3.eth.get_block(BLOCK_ID))
+        _block_info_cache["info"] = (blk["number"], blk["timestamp"])
+    return _block_info_cache["info"]
+
 
 # Cache for checksummed addresses to avoid repeated conversions
 _checksum_cache = {}
@@ -150,7 +173,8 @@ def multicall(calls: list[tuple[str, bytes]]) -> list[tuple[bool, bytes]]:
     data = SEL_AGGREGATE3 + encode(["(address,bool,bytes)[]"], [encoded])
     raw = retry(
         lambda: w3.eth.call(
-            {"to": to_checksum_cached(MULTICALL3), "data": data}
+            {"to": to_checksum_cached(MULTICALL3), "data": data},
+            block_identifier=BLOCK_ID,
         )
     )
     return decode(["(bool,bytes)[]"], raw)[0]
@@ -280,18 +304,19 @@ def discover_contract_addresses():
 def get_logs_safe(address, topics, from_block=None):
     """Get logs with fallback for range-limited RPCs."""
     start_block = from_block if from_block is not None else 0
+    to_block = hex(BLOCK_ID) if isinstance(BLOCK_ID, int) else "latest"
 
     params = {
         "address": to_checksum_cached(address),
         "topics": ["0x" + t.hex() if isinstance(t, bytes) else t for t in topics],
         "fromBlock": hex(start_block),
-        "toBlock": "latest",
+        "toBlock": to_block,
     }
     try:
         return retry(lambda: w3.eth.get_logs(params))
     except Exception as e:
         print(f"    get_logs full range failed ({e}), falling back to chunking...")
-        latest = retry(lambda: w3.eth.block_number)
+        latest = get_block_info()[0] if isinstance(BLOCK_ID, int) else retry(lambda: w3.eth.block_number)
         all_logs = []
         chunk_size = 2_000_000
         current = start_block
@@ -501,6 +526,15 @@ def fetch_data(atps, contract_addrs):
         a["staker"] = _addr(idx)
         idx += 1
 
+    # Apply per-ATP type overrides for misconfigured contracts
+    for a in atps:
+        override = ATP_TYPE_OVERRIDES.get(a["address"].lower())
+        if override is not None and a["atp_type"] != override:
+            orig = TYPE_NAMES.get(a["atp_type"], str(a["atp_type"]))
+            new = TYPE_NAMES.get(override, str(override))
+            print(f"    Type override: {a['address']} {orig} -> {new}")
+            a["atp_type"] = override
+
     # Follow-up: discover withdrawal-capable staker implementations from factory registries
     # Factory → getRegistry() → token registry
     # Token registry → getNextStakerVersion() → version count
@@ -556,7 +590,7 @@ def fetch_data(atps, contract_addrs):
             withdrawal_capable_impls = {}  # impl_addr -> set of registries
 
             def _get_code(impl_addr):
-                return impl_addr, retry(lambda a=impl_addr: w3.eth.get_code(to_checksum_cached(a)))
+                return impl_addr, retry(lambda a=impl_addr: w3.eth.get_code(to_checksum_cached(a), block_identifier=BLOCK_ID))
 
             with ThreadPoolExecutor(max_workers=len(impl_to_regs) or 1) as pool:
                 for impl_addr, code in pool.map(_get_code, impl_to_regs.keys()):
@@ -576,7 +610,7 @@ def fetch_data(atps, contract_addrs):
     # Step 5: Query WITHDRAWAL_TIMESTAMP from each withdrawal-capable staker implementation
     # Use the BEST (earliest passed) timestamp for each factory, since users can upgrade
     # to any available staker version — not just the one they're currently using.
-    now_ts = int(time.time())
+    now_ts = get_block_info()[1]
     factory_best_withdrawal_ts = {}  # factory (lower) -> earliest WITHDRAWAL_TIMESTAMP
     if withdrawal_capable_impls:
         impl_addrs = list(withdrawal_capable_impls.keys())
@@ -738,8 +772,7 @@ def display(atps, data):
     token_sale_balance = data["token_sale_balance"]
     factory_bals = data["factory_bals"]
 
-    now = int(time.time())
-    block = retry(lambda: w3.eth.block_number)
+    block, now = get_block_info()
 
     # Per-factory unlock fractions (each factory has its own Registry with its own schedule)
     factory_fracs = {}
@@ -758,30 +791,21 @@ def display(atps, data):
     #   when WITHDRAWAL_TIMESTAMP has passed.
     for a in atps:
         wts = a.get("withdrawal_ts")
-        frac = factory_fracs.get(a["factory"], 0.0)
         if a["atp_type"] == 2:
             # NCATP: claim() always reverts, only unlockable via staker withdrawal
             if wts is not None and now >= wts:
                 a["locked"] = 0
             else:
                 a["locked"] = a["allocation"]
-        elif a["atp_type"] == 1:
-            # MATP: indefinitely locked until milestone approved or staker withdrawal
-            # getClaimable() returns 0 for pending milestones regardless of global lock
-            unlocked = a.get("claimable", 0) + a["claimed"]
-            if unlocked >= a["allocation"]:
-                a["locked"] = 0
-            elif wts is not None and now >= wts:
-                a["locked"] = 0
-            else:
-                a["locked"] = max(0, a["allocation"] - unlocked)
         else:
-            # LATP: use earliest of global lock end or WITHDRAWAL_TIMESTAMP
-            # getClaimable() is capped by balance, so also check if global lock fully ended
+            # LATP/MATP: unlocked = getClaimable() + getClaimed()
+            # getClaimable() respects both global and local lock schedules.
+            # For MATPs, getClaimable() returns 0 for pending milestones.
+            # Note: getClaimable() is capped by balanceOf(this), so staked-out ATPs
+            # show claimable=0 even if locks ended — the WITHDRAWAL_TIMESTAMP check
+            # handles that case (tokens can be unstaked once it passes).
             unlocked = a.get("claimable", 0) + a["claimed"]
             if unlocked >= a["allocation"]:
-                a["locked"] = 0
-            elif frac >= 1.0:
                 a["locked"] = 0
             elif wts is not None and now >= wts:
                 a["locked"] = 0
@@ -1011,6 +1035,7 @@ def display(atps, data):
                 "staked": 0,
                 "in_contracts": 0,
                 "claimed": 0,
+                "types": {},
             }
         factory_info[factory]["count"] += 1
         factory_info[factory]["allocation"] += a["allocation"]
@@ -1018,6 +1043,8 @@ def display(atps, data):
         factory_info[factory]["staked"] += a["staked"]
         factory_info[factory]["in_contracts"] += a["balance"]
         factory_info[factory]["claimed"] += a["claimed"]
+        t_name = TYPE_NAMES.get(a["atp_type"], f"Unknown({a['atp_type']})")
+        factory_info[factory]["types"][t_name] = factory_info[factory]["types"].get(t_name, 0) + 1
 
     print(f"\n{'='*70}")
     print(f"  ATP FACTORY BREAKDOWN")
@@ -1027,8 +1054,9 @@ def display(atps, data):
         # Get factory name
         factory_name = factory_names.get(factory_addr, factory_addr[:10] + "...")
 
+        type_str = ", ".join(f"{cnt} {t}" for t, cnt in sorted(info["types"].items()))
         print(f"\n  {factory_name}")
-        print(f"    ATPs:                      {info['count']:>4}")
+        print(f"    ATPs:                      {info['count']:>4}  [{type_str}]")
         print(f"    Total allocation:          {fmt(info['allocation']):>22} AZTEC")
         print(f"    Locked:                    {fmt(info['locked']):>22} AZTEC  ({pct(info['locked'], info['allocation'])})")
         print(f"    Staked (gov/rollup):       {fmt(info['staked']):>22} AZTEC  ({pct(info['staked'], info['allocation'])})")
@@ -1274,6 +1302,13 @@ def display(atps, data):
 
 
 def main():
+    block_num, block_ts = get_block_info()
+    if isinstance(BLOCK_ID, int):
+        dt = datetime.fromtimestamp(block_ts, tz=timezone.utc)
+        print(f"\n  *** HISTORICAL MODE: block {block_num} ({dt.strftime('%Y-%m-%d %H:%M UTC')}) ***")
+    else:
+        print(f"\n  Querying at latest block {block_num}")
+
     # discover_contract_addresses and fetch_atps are independent — run in parallel
     print("\n" + "=" * 70)
     print("  DISCOVERING CONTRACTS + FETCHING ATP EVENTS (parallel)")
