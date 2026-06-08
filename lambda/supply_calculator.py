@@ -76,6 +76,7 @@ def calculate_supply():
         locked_future_incentives = data["other_bals"].get("Future Incentives", 0)
         locked_y1_rewards = data["other_bals"].get("Y1 Network Rewards", 0)
         locked_investor_wallet = data["other_bals"].get("Investor Wallet", 0)
+        locked_protocol_guild = data["other_bals"].get("Protocol Guild", 0)
         locked_factories = sum(data["factory_bals"].values())
         locked_slashed = data["total_slashed_funds"]
         locked_flush_rewarder = data["flush_rewarder_locked"]
@@ -89,6 +90,7 @@ def calculate_supply():
             + locked_future_incentives
             + locked_y1_rewards
             + locked_investor_wallet
+            + locked_protocol_guild
             + locked_factories
             + locked_slashed
             + locked_flush_rewarder
@@ -138,6 +140,7 @@ def calculate_supply():
                 "future_incentives": str(locked_future_incentives),
                 "y1_rewards": str(locked_y1_rewards),
                 "investor_wallet": str(locked_investor_wallet),
+                "protocol_guild": str(locked_protocol_guild),
                 "factories": str(locked_factories),
                 "slashed_funds": str(locked_slashed),
                 "flush_rewarder": str(locked_flush_rewarder),
