@@ -22,6 +22,7 @@ Requirements: pip install web3
 
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +75,7 @@ UNISWAP_POOL = "0x000000000004444c5dc75cB358380D2e3dE08A90"  # Unlocked
 FUTURE_INCENTIVES = "0x662De311f94bdbB571D95B5909e9cC6A25a6802a"  # Locked
 Y1_REWARDS = "0x3D6A1B00C830C5f278FC5dFb3f6Ff0b74Db6dfe0"  # Locked
 INVESTOR_WALLET = "0x92ba0fd39658105fac4df2b9bade998b5816b350"  # Locked (temporary)
+PROTOCOL_GUILD = "0x25941dC771bB64514Fc8abBce970307Fb9d477e9"  # Locked
 FLUSH_REWARDER = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"  # Locked (rewardsAvailable)
 
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -317,8 +319,10 @@ def get_logs_safe(address, topics, from_block=None):
     except Exception as e:
         print(f"    get_logs full range failed ({e}), falling back to chunking...")
         latest = get_block_info()[0] if isinstance(BLOCK_ID, int) else retry(lambda: w3.eth.block_number)
+        # Respect the RPC's advertised max range if it tells us; else start broad.
+        m = re.search(r"maxAllowedRange['\"]?\s*:\s*(\d+)", str(e))
+        chunk_size = int(m.group(1)) if m else 2_000_000
         all_logs = []
-        chunk_size = 2_000_000
         current = start_block
         while current <= latest:
             params["fromBlock"] = hex(current)
@@ -328,8 +332,8 @@ def get_logs_safe(address, topics, from_block=None):
                 all_logs.extend(chunk_logs)
                 current += chunk_size
             except Exception:
-                chunk_size = chunk_size // 4
-                if chunk_size < 10_000:
+                chunk_size = chunk_size // 2
+                if chunk_size < 1_000:
                     raise
         return all_logs
 
@@ -400,8 +404,8 @@ def fetch_data(atps, contract_addrs):
 
     # [...] Balances: other contracts
     other_start_idx = len(calls)
-    other_contracts = [FUTURE_INCENTIVES, Y1_REWARDS, INVESTOR_WALLET, UNISWAP_POOL]
-    other_names = ["Future Incentives", "Y1 Network Rewards", "Investor Wallet", "Uniswap Pool"]
+    other_contracts = [FUTURE_INCENTIVES, Y1_REWARDS, INVESTOR_WALLET, PROTOCOL_GUILD, UNISWAP_POOL]
+    other_names = ["Future Incentives", "Y1 Network Rewards", "Investor Wallet", "Protocol Guild", "Uniswap Pool"]
     for addr in other_contracts:
         calls.append((AZTEC_TOKEN, _encode_bal(addr)))
 
@@ -833,6 +837,7 @@ def display(atps, data):
     locked_future_incentives = other_bals.get("Future Incentives", 0)
     locked_y1_rewards = other_bals.get("Y1 Network Rewards", 0)
     locked_investor_wallet = other_bals.get("Investor Wallet", 0)
+    locked_protocol_guild = other_bals.get("Protocol Guild", 0)
     locked_factories = sum(factory_bals.values())
 
     # Rollup balance breakdown (sum of all historical rollup instances):
@@ -863,6 +868,7 @@ def display(atps, data):
         + locked_future_incentives
         + locked_y1_rewards
         + locked_investor_wallet
+        + locked_protocol_guild
         + locked_factories
         + locked_slashed
         + locked_flush_rewarder
@@ -912,6 +918,11 @@ def display(atps, data):
         print(
             f"    Investor Wallet:   {fmt(locked_investor_wallet):>27} AZTEC"
             f"  ({pct(locked_investor_wallet, total_supply)})"
+        )
+    if locked_protocol_guild:
+        print(
+            f"    Protocol Guild:    {fmt(locked_protocol_guild):>27} AZTEC"
+            f"  ({pct(locked_protocol_guild, total_supply)})"
         )
     if locked_factories:
         print(
@@ -1261,6 +1272,7 @@ def display(atps, data):
             "future_incentives": str(locked_future_incentives),
             "y1_rewards": str(locked_y1_rewards),
             "investor_wallet": str(locked_investor_wallet),
+            "protocol_guild": str(locked_protocol_guild),
             "factories": str(locked_factories),
             "slashed_funds": str(locked_slashed),
         },
